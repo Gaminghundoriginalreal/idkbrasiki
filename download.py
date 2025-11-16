@@ -1,24 +1,3 @@
-# client_qt.py
-"""
-NovaShield – PyQt6 client
-
-- Modern dark UI with sidebar navigation
-- Connects to NovaShield backend (HTTP API)
-- ALL antivirus features require an active plan
-- Login/session is persisted between restarts (settings.json)
-- On startup it:
-    * Tries to restore your session with stored api_key
-    * If api_key is invalid but username/password are stored, it auto-logins again
-    * Checks a remote update-info script and shows an update box if something changed
-
-Antivirus logic:
-- Simple signature + heuristic scanner:
-  * Hardcoded hash blacklist
-  * Suspicious extensions & sizes
-
-NOTE: This is still not a professional antivirus engine.
-"""
-
 import os
 import json
 import hashlib
