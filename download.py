@@ -1,3 +1,27 @@
+# client_qt.py
+"""
+NovaShield – PyQt6 client with pre-launch updater
+
+- Modern dark UI with sidebar navigation
+- Connects to NovaShield backend (HTTP API)
+- ALL antivirus features require an active plan
+- Login/session is persisted between restarts (settings.json)
+- On startup it:
+    * Shows a small updater window with progress bar
+    * Downloads latest update info from your GitHub URL
+    * If contents changed, stores new hash and shows "Need to update! Updating now..."
+    * Then launches the main NovaShield window
+
+Antivirus logic:
+- Simple signature + heuristic scanner:
+  * Hardcoded hash blacklist
+  * Suspicious extensions & sizes
+
+NOTE: This is not a professional antivirus engine like Malwarebytes.
+It does not execute arbitrary remote code – it only downloads text and
+uses it as version/update information.
+"""
+
 import os
 import json
 import hashlib
@@ -31,24 +55,21 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QRadioButton,
     QButtonGroup,
+    QDialog,
+    QFormLayout,
 )
 
 # -------------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------------
 
-# Backend connection config
 SERVER_IP = "91.89.111.120"
 SERVER_PORT = 5050
 BASE_URL = f"http://{SERVER_IP}:{SERVER_PORT}"
 
-# Where we store login + session data
 SETTINGS_FILE = "settings.json"
 
-# Local client version (you can bump this when you change client_qt.py)
 CURRENT_VERSION = "1.0.0"
-
-# URL to remote update-info script (provided by you)
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/Gaminghundoriginalreal/idkbrasiki/refs/heads/main/download.py"
 
 
@@ -56,13 +77,10 @@ UPDATE_INFO_URL = "https://raw.githubusercontent.com/Gaminghundoriginalreal/idkb
 # Simple AV engine (signatures + heuristics)
 # -------------------------------------------------------------------------
 
-# Example blacklist of SHA256 hashes (fill with known malware hashes if you want)
 KNOWN_BAD_HASHES = {
-    # Placeholder demo hash
     "0000000000000000000000000000000000000000000000000000000000000000": "Test.Dummy.Sample",
 }
 
-# File types considered suspicious if large
 SUSPICIOUS_EXTENSIONS = {".exe", ".dll", ".scr", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jar", ".msi"}
 
 
@@ -75,10 +93,6 @@ def file_hash(path: Path) -> str:
 
 
 def simple_scan_file(path: Path) -> Tuple[bool, Optional[str]]:
-    """
-    Return (infected: bool, reason/signature)
-    - True if in blacklist or suspicious based on heuristics
-    """
     try:
         h = file_hash(path)
     except Exception:
@@ -93,7 +107,6 @@ def simple_scan_file(path: Path) -> Tuple[bool, Optional[str]]:
     except Exception:
         size = 0
 
-    # Simple heuristics: suspicious extension + size threshold
     if ext in SUSPICIOUS_EXTENSIONS and size > 50 * 1024:
         return True, f"Suspicious.{ext[1:].upper()}.Heuristic"
 
@@ -105,9 +118,9 @@ def simple_scan_file(path: Path) -> Tuple[bool, Optional[str]]:
 # -------------------------------------------------------------------------
 
 class ScanWorker(QThread):
-    progress = pyqtSignal(int, int)  # current, total
+    progress = pyqtSignal(int, int)
     log_line = pyqtSignal(str)
-    finished_scan = pyqtSignal(int, int, str)  # clean, infected, label
+    finished_scan = pyqtSignal(int, int, str)
 
     def __init__(self, roots: List[Path], label: str, parent=None):
         super().__init__(parent)
@@ -166,6 +179,163 @@ class RealtimeWorker(QThread):
                             msg = f"[OK] {path}\n"
                         self.log_line.emit(msg)
             self.msleep(3000)
+
+
+# -------------------------------------------------------------------------
+# Shared helpers
+# -------------------------------------------------------------------------
+
+def load_settings() -> dict:
+    if not os.path.exists(SETTINGS_FILE):
+        return {}
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+# -------------------------------------------------------------------------
+# Updater dialog (pre-launch window)
+# -------------------------------------------------------------------------
+
+class UpdaterWorker(QThread):
+    progress = pyqtSignal(int)
+    status_text = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)  # (changed, first_line_or_msg)
+
+    def run(self):
+        # Simulate steps for the progress bar
+        self.progress.emit(5)
+        self.status_text.emit("Checking for updates...")
+        settings = load_settings()
+        old_hash = settings.get("update_hash")
+
+        try:
+            self.progress.emit(25)
+            resp = requests.get(UPDATE_INFO_URL, timeout=5)
+            if resp.status_code != 200:
+                self.status_text.emit("Update check failed (HTTP error).")
+                self.progress.emit(100)
+                self.finished.emit(False, "Update check failed.")
+                return
+
+            content = resp.text
+            new_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+            self.progress.emit(60)
+
+            # Save latest content locally as info (not executed)
+            try:
+                with open("latest_update_info.txt", "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception:
+                pass
+
+            # No change compared to last time
+            if old_hash and old_hash == new_hash:
+                self.status_text.emit("No update required.")
+                settings["update_hash"] = new_hash
+                save_settings(settings)
+                self.progress.emit(100)
+                self.finished.emit(False, "")
+                return
+
+            # New update detected
+            settings["update_hash"] = new_hash
+            save_settings(settings)
+
+            first_line = content.splitlines()[0].strip() if content.splitlines() else "New version available."
+            self.status_text.emit("Need to update! Updating now...")
+            self.progress.emit(100)
+            self.finished.emit(True, first_line)
+
+        except Exception as e:
+            self.status_text.emit(f"Update check failed: {e}")
+            self.progress.emit(100)
+            self.finished.emit(False, "Update check failed.")
+
+
+class UpdaterDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("NovaShield – Initializing")
+        self.setModal(True)
+        self.setFixedSize(420, 200)
+        self.setStyleSheet("background-color: #020617; color: #e5e7eb;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel("Preparing NovaShield")
+        title.setStyleSheet("color: #38bdf8; font-size: 14pt; font-weight: bold;")
+        layout.addWidget(title)
+
+        self.info_label = QLabel("Checking for updates...")
+        self.info_label.setStyleSheet("color: #9ca3af; font-size: 9pt;")
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        layout.addSpacing(10)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: #020617;
+                border: 1px solid #1f2937;
+                border-radius: 6px;
+            }
+            QProgressBar::chunk {
+                background-color: #38bdf8;
+                border-radius: 6px;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+
+        self.detail_label = QLabel("")
+        self.detail_label.setStyleSheet("color: #e5e7eb; font-size: 9pt;")
+        self.detail_label.setWordWrap(True)
+        layout.addWidget(self.detail_label)
+
+        layout.addStretch()
+
+        self.worker = UpdaterWorker()
+        self.worker.progress.connect(self.progress_bar.setValue)
+        self.worker.status_text.connect(self.info_label.setText)
+        self.worker.finished.connect(self.on_finished)
+        self.worker.start()
+
+        self._updated = False
+        self._update_info = ""
+
+    def on_finished(self, changed: bool, info: str):
+        self._updated = changed
+        self._update_info = info
+        # Keep dialog for a very short moment to show status, then accept
+        QTimer = __import__("PyQt6.QtCore").QtCore.QTimer
+        timer = QTimer(self)
+        def close_later():
+            self.accept()
+        timer.singleShot(600, close_later)
+
+    @property
+    def updated(self) -> bool:
+        return self._updated
+
+    @property
+    def update_info(self) -> str:
+        return self._update_info
 
 
 # -------------------------------------------------------------------------
@@ -236,57 +406,35 @@ class MainWindow(QMainWindow):
 
         self.api_key: Optional[str] = None
         self.username: Optional[str] = None
-        self.password: Optional[str] = None  # stored for auto-login if backend restarted
+        self.password: Optional[str] = None
         self.current_plan: Optional[str] = None
         self.has_active_plan: bool = False
 
         self.realtime_stop_flag = threading.Event()
         self.realtime_worker: Optional[RealtimeWorker] = None
 
-        self.update_hash: Optional[str] = None
+        self._settings = load_settings()
+        self.api_key = self._settings.get("api_key")
+        self.username = self._settings.get("username")
+        self.password = self._settings.get("password")
 
-        self._load_settings()
         self._build_ui()
 
-        # Try to restore session
         if self.api_key:
             self.refresh_status(silent=True, allow_relogin=True)
 
-        # Check for updates after UI is ready
-        self.check_for_updates()
+        # Dashboard update box honors updater info if available
+        self._apply_update_box_from_settings()
 
     # ------------------------------------------------------------------
-    # Settings (session persistence)
+    # Settings sync helpers
     # ------------------------------------------------------------------
-
-    def _load_settings(self):
-        if not os.path.exists(SETTINGS_FILE):
-            return
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.api_key = data.get("api_key")
-            self.username = data.get("username")
-            self.password = data.get("password")
-            self.update_hash = data.get("update_hash")
-        except Exception:
-            self.api_key = None
-            self.username = None
-            self.password = None
-            self.update_hash = None
 
     def _save_settings(self):
-        data = {
-            "api_key": self.api_key,
-            "username": self.username,
-            "password": self.password,
-            "update_hash": self.update_hash,
-        }
-        try:
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+        self._settings["api_key"] = self.api_key
+        self._settings["username"] = self.username
+        self._settings["password"] = self.password
+        save_settings(self._settings)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -304,7 +452,6 @@ class MainWindow(QMainWindow):
         root_layout = QHBoxLayout(central)
         root_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Sidebar
         sidebar = QFrame()
         sidebar.setFixedWidth(260)
         sidebar.setStyleSheet("background-color: #020617; border-right: 1px solid #1f2937;")
@@ -312,7 +459,6 @@ class MainWindow(QMainWindow):
         sb_layout = QVBoxLayout(sidebar)
         sb_layout.setContentsMargins(16, 16, 16, 16)
 
-        # Brand
         title = QLabel("NovaShield")
         title.setStyleSheet("color: #38bdf8; font-size: 20pt; font-weight: bold;")
         subtitle = QLabel("Realtime protection")
@@ -322,7 +468,6 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(subtitle)
         sb_layout.addSpacing(10)
 
-        # Status card
         status_frame = QFrame()
         status_frame.setStyleSheet("background-color: #020617; border: 1px solid #1f2937; border-radius: 8px;")
         status_layout = QVBoxLayout(status_frame)
@@ -339,7 +484,6 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(status_frame)
         sb_layout.addSpacing(10)
 
-        # Nav buttons
         self.btn_dashboard = SidebarButton("  Dashboard")
         self.btn_scanner = SidebarButton("  Smart / Full Scan")
         self.btn_realtime = SidebarButton("  Real-Time Shield")
@@ -351,7 +495,6 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(self.btn_account)
         sb_layout.addWidget(hline())
 
-        # Auth buttons
         auth_row = QHBoxLayout()
         self.btn_login = AccentButton("Sign in / Register")
         self.btn_logout = QPushButton("Sign out")
@@ -384,7 +527,6 @@ class MainWindow(QMainWindow):
         info.setWordWrap(True)
         sb_layout.addWidget(info)
 
-        # Pages
         self.pages = QStackedWidget()
         self.pages.setStyleSheet("background-color: #020617;")
 
@@ -401,14 +543,13 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(sidebar)
         root_layout.addWidget(self.pages, 1)
 
-        # Connect nav buttons
         self.btn_dashboard.clicked.connect(lambda: self.pages.setCurrentWidget(self.page_dashboard))
         self.btn_scanner.clicked.connect(lambda: self.pages.setCurrentWidget(self.page_scanner))
         self.btn_realtime.clicked.connect(lambda: self.pages.setCurrentWidget(self.page_realtime))
         self.btn_account.clicked.connect(lambda: self.pages.setCurrentWidget(self.page_account))
 
     # ------------------------------------------------------------------
-    # Dashboard Page (with update box)
+    # Dashboard Page (with update info box)
     # ------------------------------------------------------------------
 
     def _build_dashboard_page(self):
@@ -416,7 +557,6 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        # Update box (hidden by default, shown when check_for_updates finds changes)
         self.update_box = self._card()
         ub_layout = QVBoxLayout(self.update_box)
         ub_layout.setContentsMargins(14, 12, 14, 12)
@@ -485,6 +625,26 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return page
 
+    def _apply_update_box_from_settings(self):
+        # Show brief info if "latest_update_info.txt" exists and hash is present
+        info_path = Path("latest_update_info.txt")
+        if not info_path.exists():
+            return
+        try:
+            content = info_path.read_text(encoding="utf-8")
+        except Exception:
+            return
+        first_line = content.splitlines()[0].strip() if content.splitlines() else ""
+        if not first_line:
+            return
+        self.update_title.setText("Need to update! Updating now...")
+        self.update_message.setText(
+            f"A newer version is available.\n\n"
+            f"Latest info from server:\n{first_line}"
+        )
+        self.update_box.setStyleSheet("background-color: #020617; border: 1px solid #38bdf8; border-radius: 10px;")
+        self.update_box.setVisible(True)
+
     # ------------------------------------------------------------------
     # Scanner Page
     # ------------------------------------------------------------------
@@ -494,7 +654,6 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        # Left side controls
         left = self._card()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(14, 12, 14, 12)
@@ -509,7 +668,6 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(sub)
         left_layout.addSpacing(10)
 
-        # Smart scan
         smart_title = QLabel("Smart scan")
         smart_title.setStyleSheet("color: #e5e7eb; font-weight: bold;")
         left_layout.addWidget(smart_title)
@@ -525,7 +683,6 @@ class MainWindow(QMainWindow):
 
         left_layout.addSpacing(10)
 
-        # Full scan
         full_title = QLabel("Full system scan")
         full_title.setStyleSheet("color: #e5e7eb; font-weight: bold;")
         left_layout.addWidget(full_title)
@@ -543,7 +700,6 @@ class MainWindow(QMainWindow):
 
         left_layout.addSpacing(10)
 
-        # Custom scan
         custom_title = QLabel("Custom folder")
         custom_title.setStyleSheet("color: #e5e7eb; font-weight: bold;")
         left_layout.addWidget(custom_title)
@@ -570,7 +726,6 @@ class MainWindow(QMainWindow):
 
         left_layout.addStretch()
 
-        # Right side results
         right = self._card()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(14, 12, 14, 12)
@@ -764,8 +919,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def show_login_dialog(self):
-        from PyQt6.QtWidgets import QDialog, QFormLayout
-
         dlg = QDialog(self)
         dlg.setWindowTitle("Sign in / Register")
         dlg.setStyleSheet("background-color: #020617; color: #e5e7eb;")
@@ -821,7 +974,7 @@ class MainWindow(QMainWindow):
                 if r.status_code == 200:
                     self.api_key = data["api_key"]
                     self.username = username
-                    self.password = password  # store for auto-login later
+                    self.password = password
                     self._save_settings()
                     self.status_label.setText(f"Signed in as {username}")
                     self.refresh_status()
@@ -838,7 +991,6 @@ class MainWindow(QMainWindow):
 
     def logout(self):
         self.api_key = None
-        # We keep username/password so we can auto-login again later if user wants
         self.current_plan = None
         self.has_active_plan = False
         self._save_settings()
@@ -876,7 +1028,6 @@ class MainWindow(QMainWindow):
                 )
                 self._update_plan_state(plan)
             else:
-                # If api_key invalid and we have username/password -> try auto-login
                 err = data.get("error", "")
                 if allow_relogin and "Invalid api_key" in err and self.username and self.password:
                     self._auto_login_after_restart()
@@ -892,7 +1043,6 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", str(e))
 
     def _auto_login_after_restart(self):
-        # This is used when backend restarted and old api_key is invalid
         try:
             r = requests.post(
                 f"{BASE_URL}/api/login",
@@ -904,7 +1054,6 @@ class MainWindow(QMainWindow):
                 self.api_key = data["api_key"]
                 self._save_settings()
                 self.status_label.setText(f"Signed in as {self.username}")
-                # After getting new api_key, call refresh_status again (no infinite loop)
                 self.refresh_status(silent=True, allow_relogin=False)
             else:
                 self.account_info.setText(f"Error: {data.get('error', 'Unknown error')}")
@@ -1059,16 +1208,10 @@ class MainWindow(QMainWindow):
         self._report_scan(clean, infected)
 
         if infected == 0:
-            text = (
-                f"✓ {label} completed.\n"
-                f"Clean objects: {clean} • Threats: {infected}"
-            )
+            text = f"✓ {label} completed.\nClean objects: {clean} • Threats: {infected}"
             color = "#4ade80"
         else:
-            text = (
-                f"⚠ {label} completed.\n"
-                f"Clean objects: {clean} • Threats detected: {infected}"
-            )
+            text = f"⚠ {label} completed.\nClean objects: {clean} • Threats detected: {infected}"
             color = "#f97373"
         self.scan_summary.setText(text)
         self.scan_summary.setStyleSheet(f"color: {color}; font-size: 9pt;")
@@ -1106,7 +1249,6 @@ class MainWindow(QMainWindow):
             self.rt_toggle.setChecked(False)
             return
 
-        # Determine roots
         checked_button = self.rt_mode_group.checkedButton()
         mode_text = checked_button.text() if checked_button else ""
 
@@ -1141,52 +1283,10 @@ class MainWindow(QMainWindow):
         self.rt_log.moveCursor(self.rt_log.textCursor().MoveOperation.End)
         self.rt_log.insertPlainText(line)
 
-    # ------------------------------------------------------------------
-    # Update checker (using your GitHub raw script as version source)
-    # ------------------------------------------------------------------
 
-    def check_for_updates(self):
-        """
-        Downloads the content at UPDATE_INFO_URL and compares its hash
-        against the last stored hash. If it's different, we show a modern
-        update box saying that an update is available.
-
-        Aus Sicherheitsgründen wird der Code NICHT automatisch ausgeführt,
-        sondern nur der Text/Hash als Info verwendet.
-        """
-        try:
-            resp = requests.get(UPDATE_INFO_URL, timeout=5)
-            if resp.status_code != 200:
-                return
-            content = resp.text
-            new_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-            # If we have never seen this hash before, treat as "needs update"
-            if self.update_hash and self.update_hash == new_hash:
-                # No change
-                return
-
-            # Update available (or first time)
-            self.update_hash = new_hash
-            self._save_settings()
-
-            # Show only a short preview of the first line as "latest version" info
-            first_line = content.splitlines()[0].strip() if content.splitlines() else "New version available."
-
-            self.update_title.setText("Need to update! Updating info…")
-            self.update_message.setText(
-                f"A newer version is available.\n\n"
-                f"Latest info from server:\n{first_line}"
-            )
-            self.update_box.setStyleSheet(
-                "background-color: #020617; border: 1px solid #38bdf8; border-radius: 10px;"
-            )
-            self.update_box.setVisible(True)
-
-        except Exception:
-            # Silently ignore update issues
-            pass
-
+# -------------------------------------------------------------------------
+# main()
+# -------------------------------------------------------------------------
 
 def main():
     import sys
@@ -1194,6 +1294,12 @@ def main():
     QApplication.setStyle("Fusion")
     font = QFont("Segoe UI", 10)
     app.setFont(font)
+
+    # Pre-launch updater dialog
+    upd = UpdaterDialog()
+    upd.exec()
+
+    # After updater closes, launch main window
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
